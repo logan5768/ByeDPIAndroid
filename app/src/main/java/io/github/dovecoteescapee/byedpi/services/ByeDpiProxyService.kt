@@ -143,6 +143,9 @@ class ByeDpiProxyService : LifecycleService() {
         proxy.stopProxy()
         proxyJob?.join()
         proxyJob = null
+        // startProxy() создаёт новый ByeDpiProxy на каждый запуск, а он владеет
+        // выделенным потоком движка — отпускаем его, иначе поток течёт на каждый рестарт.
+        proxy.dispose()
 
         Log.i(TAG, "Proxy stopped")
     }

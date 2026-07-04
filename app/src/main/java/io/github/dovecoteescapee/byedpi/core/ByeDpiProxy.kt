@@ -1,7 +1,10 @@
 package io.github.dovecoteescapee.byedpi.core
 
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
 
 class ByeDpiProxy {
     companion object {
@@ -13,13 +16,25 @@ class ByeDpiProxy {
     private val mutex = Mutex()
     private var fd = -1
 
-    suspend fun startProxy(preferences: ByeDpiProxyPreferences): Int {
-        val fd = createSocket(preferences)
-        if (fd < 0) {
-            return -1 // TODO: should be error code
+    // Нативные params/NOT_EXIT теперь thread-local (__thread): у каждого движка своя
+    // копия — это и даёт ПАРАЛЛЕЛЬНЫЙ перебор (несколько ByeDpiProxy одновременно).
+    // Условие корректности: createSocket (пишет params) и jniStartProxy/event_loop
+    // (читают params, а по выходе делают reset_params) обязаны идти на ОДНОМ и том же
+    // OS-потоке. Поэтому пришпиливаем их к выделенному однопоточному исполнителю.
+    // stopProxy НЕ идёт сюда: этот поток занят блокирующим event_loop; shutdown fd
+    // потокобезопасен и будит event_loop извне.
+    private val engineExecutor =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "byedpi-engine") }
+    private val engineDispatcher = engineExecutor.asCoroutineDispatcher()
+
+    suspend fun startProxy(preferences: ByeDpiProxyPreferences): Int =
+        withContext(engineDispatcher) {
+            val fd = createSocket(preferences)
+            if (fd < 0) {
+                return@withContext -1 // TODO: should be error code
+            }
+            jniStartProxy(fd)
         }
-        return jniStartProxy(fd)
-    }
 
     suspend fun stopProxy(): Int {
         mutex.withLock {
@@ -33,6 +48,11 @@ class ByeDpiProxy {
             }
             return result
         }
+    }
+
+    /** Освобождает выделенный поток движка. Звать после того, как startProxy завершился. */
+    fun dispose() {
+        engineExecutor.shutdownNow()
     }
 
     private suspend fun createSocket(preferences: ByeDpiProxyPreferences): Int =

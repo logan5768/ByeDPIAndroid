@@ -271,11 +271,16 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniStartProxy(
         jint fd) {
     LOG(LOG_S, "start_proxy, fd: %d", fd);
     NOT_EXIT = 1;
-    if (event_loop(fd) < 0) {
+    int rc = event_loop(fd);
+    if (rc < 0) {
         uniperror("event_loop");
-        return get_e();
+        rc = get_e();
     }
-    return 0;
+    // params/NOT_EXIT — thread-local: чистим ИМЕННО на потоке движка (после того как
+    // event_loop вышел), а не на потоке, дёрнувшем stop. Иначе reset_params() затрёт
+    // пустой thread-local чужого потока и утечёт dp/mempool этого движка.
+    reset_params();
+    return rc;
 }
 
 JNIEXPORT jint JNICALL
@@ -285,8 +290,10 @@ Java_io_github_dovecoteescapee_byedpi_core_ByeDpiProxy_jniStopProxy(
         jint fd) {
     LOG(LOG_S, "stop_proxy, fd: %d", fd);
 
+    // Только рвём слушающий сокет: event_loop на своём потоке получит POLLHUP,
+    // выставит свой thread-local NOT_EXIT=0, выйдет и сам вызовет reset_params().
+    // reset_params() здесь звать НЕЛЬЗЯ — мы на чужом потоке (см. jniStartProxy).
     int res = shutdown(fd, SHUT_RDWR);
-    reset_params();
 
     if (res < 0) {
         uniperror("shutdown");

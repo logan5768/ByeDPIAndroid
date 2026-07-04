@@ -14,28 +14,39 @@ import io.github.dovecoteescapee.byedpi.core.ProbeResult
 import io.github.dovecoteescapee.byedpi.core.Target
 import io.github.dovecoteescapee.byedpi.core.TargetRole
 import io.github.dovecoteescapee.byedpi.core.TestCommandGenerator
+import io.github.dovecoteescapee.byedpi.core.YtStream
 import io.github.dovecoteescapee.byedpi.data.AppStatus
 import io.github.dovecoteescapee.byedpi.databinding.ActivityTestBinding
 import io.github.dovecoteescapee.byedpi.services.appStatus
 import io.github.dovecoteescapee.byedpi.utility.getPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 class TestActivity : AppCompatActivity() {
     private lateinit var binding: ActivityTestBinding
-    private val tester = ByeDpiTester()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private var job: Job? = null
 
     companion object {
         private val TAG: String = TestActivity::class.java.simpleName
+
+        // Сколько движков ByeDPI гоняем ОДНОВРЕМЕННО. Стало возможно потому, что
+        // нативные params/NOT_EXIT теперь thread-local (по копии на поток-движок).
+        // 4 — компромисс: быстрее в ~4×, но не заваливаем stateful-DPI параллельными
+        // хендшейками настолько, чтобы он массово «чёрнодырил» googlevideo.
+        private const val WORKERS = 4
+        private const val BASE_PORT = 10080
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -77,55 +88,80 @@ class TestActivity : AppCompatActivity() {
         binding.btnStart.setText(R.string.test_stop)
 
         job = lifecycleScope.launch {
+            // По движку на воркер, каждый на своём порту. thread-local params делают
+            // их независимыми — можно гонять параллельно.
+            val testers = (0 until WORKERS).map { ByeDpiTester(testPort = BASE_PORT + it) }
+            val targets = testers[0].targets
+
+            // --- Свежий видео-URL рикролла: добываем ОДИН раз программно (InnerTube),
+            // раздаём всем воркерам. Есть URL → видео проверяется реальным медиа-GET;
+            // нет (DPI режет сам youtube.com) → откат на SNI-хендшейк. ---
+            appendLine("Получаю свежий видео-URL рикролла…")
+            val pv = withContext(Dispatchers.IO) { YtStream.fetchPlayback() }
+            if (pv != null) {
+                testers.forEach { it.videoUrl = pv }
+                appendLine("  видео-URL получен (${pv.host}) — тест по реальному потоку", stamp = false)
+            } else {
+                appendLine("  видео-URL не добыт — откат на SNI-хендшейк googlevideo", stamp = false)
+            }
+
             // --- BASELINE: контрольный замер без прокси ---
             appendLine("BASELINE (без прокси)")
-            val base = tester.baseline()
-            for ((t, p) in tester.targets.zip(base)) appendLine(probeLine(t, p), stamp = false)
+            val base = testers[0].baseline()
+            for ((t, p) in targets.zip(base)) appendLine(probeLine(t, p), stamp = false)
 
-            // Всегда полный (глубокий) список: компактный набор ненадёжен против
-            // stateful-DPI, который на короткое время «чёрнодырит» googlevideo после
-            // первых неудачных хендшейков. Полный перебор даёт цели восстановиться,
-            // прежде чем дойдёт до пробивного tlsrec-каскада.
-            val list = TestCommandGenerator.deep()
-            appendLine("ПЕРЕБОР: ${list.size} вариантов")
+            // Полный список. Разделяем на два класса по потоко-безопасности:
+            //  • parallel — можно гонять одновременно (нативные fake_udp/fake_http —
+            //    read-only, params thread-local);
+            //  • fakeTls — содержат -f (fake ClientHello): change_tls_sni ПИШЕТ в общий
+            //    буфер fake_tls, поэтому такие кандидаты нельзя пускать параллельно —
+            //    гоним их строго последовательно в конце, и то лишь если ничего не нашли.
+            val all = TestCommandGenerator.deep()
+            val fakeTls = all.filter { it.contains("-f") }
+            val parallel = all.filter { !it.contains("-f") }
+            appendLine("ПЕРЕБОР: ${all.size} (парал.: ${parallel.size} ×$WORKERS, fake→послед.: ${fakeTls.size})")
 
-            var workCount = 0
-            var idx = 0
-            for (flags in list) {
-                if (!isActive) break
-                idx++
-                val r = withContext(Dispatchers.IO) { tester.testCandidate(flags) }
+            val found = AtomicBoolean(false)
+            val nextIdx = AtomicInteger(0)
 
-                // Шапка попытки: #NN + флаги (с временной меткой).
-                appendLine("#%02d  %s".format(idx, flags))
-                // Вердикт отдельной строкой — сразу видно ЧТО зарубило вариант.
-                appendLine(verdictLine(r), stamp = false)
-                // По строке на цель — выровнено колонками, с пометками решающих/контроля.
-                for ((t, p) in tester.targets.zip(r.probes)) appendLine(probeLine(t, p), stamp = false)
-
-                // ms — НЕ критерий. Перебор идёт до конца, каждый рабочий вариант
-                // добавляется кнопкой. НО первый прошедший проверку применяется
-                // ПРОГРАММНО СРАЗУ (без ручного тапа) — приложение уже настроено,
-                // как только найден рабочий флаг. Остальные рабочие остаются
-                // кнопками: можно переключиться вручную.
-                if (r.ok) {
-                    workCount++
-                    val auto = workCount == 1
-                    // Применяем flagsToApply (может включать авто-добавленный -U для
-                    // TLS-only видео), а не сырой тестовый flags.
-                    addResultButton(r.flagsToApply, r.ms, auto)
-                    if (auto) {
-                        applyFlags(r.flagsToApply)
-                        appendLine("  → применён автоматически (видео по ${r.videoVia})", stamp = false)
+            // --- ФАЗА 1: параллельный перебор безопасных кандидатов ---
+            // Первый рабочий флаг применяется сразу и глушит остальных воркеров
+            // (cancelChildren) — цель перебора «запустить YouTube» достигнута.
+            coroutineScope {
+                // Контекст самого scope: его дети — воркеры. Через него глушим их всех,
+                // когда кто-то нашёл рабочий флаг (cancelChildren на КОНТЕКСТЕ launch'а
+                // отменил бы только его собственных детей, а не сиблингов).
+                val poolCtx = coroutineContext
+                repeat(WORKERS) { w ->
+                    launch {
+                        val t = testers[w]
+                        while (isActive && !found.get()) {
+                            val i = nextIdx.getAndIncrement()
+                            if (i >= parallel.size) break
+                            runCandidate(t, targets, parallel[i], "[п$w]", i + 1, found)
+                            if (found.get()) {
+                                poolCtx.cancelChildren() // остановить сиблингов
+                                break
+                            }
+                        }
                     }
                 }
             }
 
+            // --- ФАЗА 2: fake-кандидаты строго по одному (общий буфер fake_tls) ---
+            if (!found.get()) {
+                val t = testers[0]
+                for ((k, flags) in fakeTls.withIndex()) {
+                    if (!isActive || found.get()) break
+                    runCandidate(t, targets, flags, "[f]", parallel.size + k + 1, found)
+                }
+            }
+
             appendLine("ИТОГО")
-            if (workCount > 0) {
+            if (found.get()) {
                 appendLine(
-                    "Готово. Рабочих: $workCount. Первый уже применён автоматически — " +
-                        "можно сразу подключать VPN. Кнопками выше можно выбрать другой.",
+                    "Готово. Рабочий флаг найден и применён автоматически — можно сразу " +
+                        "подключать VPN.",
                     stamp = false,
                 )
             } else {
@@ -180,6 +216,35 @@ class TestActivity : AppCompatActivity() {
         Toast.makeText(this, getString(R.string.test_applied, flags), Toast.LENGTH_LONG).show()
     }
 
+    /**
+     * Прогоняет один кандидат (на своём движке/порту) и печатает результат. Первый
+     * прошедший проверку атомарно захватывает `found`, применяется автоматически;
+     * последующие рабочие остаются альтернативными кнопками. UI — на Main, сам тест —
+     * на IO.
+     */
+    private suspend fun runCandidate(
+        tester: ByeDpiTester,
+        targets: List<Target>,
+        flags: String,
+        tag: String,
+        no: Int,
+        found: AtomicBoolean,
+    ) {
+        val r = withContext(Dispatchers.IO) { tester.testCandidate(flags) }
+        appendLine("%s #%02d  %s".format(tag, no, flags))
+        appendLine(verdictLine(targets, r), stamp = false)
+        for ((t, p) in targets.zip(r.probes)) appendLine(probeLine(t, p), stamp = false)
+        if (r.ok) {
+            if (found.compareAndSet(false, true)) {
+                addResultButton(r.flagsToApply, r.ms, true)
+                applyFlags(r.flagsToApply)
+                appendLine("  → применён автоматически (видео по ${r.videoVia})", stamp = false)
+            } else {
+                addResultButton(r.flagsToApply, r.ms, false)
+            }
+        }
+    }
+
     // ---- форматирование лога (единое для baseline и кандидатов) ----------
 
     /** Короткое человекочитаемое имя цели. */
@@ -207,9 +272,9 @@ class TestActivity : AppCompatActivity() {
     }
 
     /** Строка вердикта попытки: WORK (каким транспортом видео) или FAILED (где упало). */
-    private fun verdictLine(r: CandidateResult): String {
+    private fun verdictLine(targets: List<Target>, r: CandidateResult): String {
         if (r.ok) return "  verdict: WORK    (${r.ms}ms — страница + видео по ${r.videoVia})"
-        val zipped = tester.targets.zip(r.probes)
+        val zipped = targets.zip(r.probes)
         val bad = zipped.firstOrNull { it.first.role == TargetRole.PAGE && !it.second.ok }
             ?: zipped.firstOrNull { it.first.role == TargetRole.VIDEO && !it.second.ok }
             ?: zipped.firstOrNull { !it.second.ok }

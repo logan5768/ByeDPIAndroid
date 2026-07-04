@@ -35,7 +35,7 @@
 #endif
 
     
-int NOT_EXIT = 1;
+__thread int NOT_EXIT = 1;
 
 static void on_cancel(int sig) {
     NOT_EXIT = 0;

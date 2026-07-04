@@ -38,7 +38,7 @@ fake_udp = {
 };
 
 
-struct params params = {
+__thread struct params params = {
     .sfdelay = 3,
     .wait_send = 1,
     

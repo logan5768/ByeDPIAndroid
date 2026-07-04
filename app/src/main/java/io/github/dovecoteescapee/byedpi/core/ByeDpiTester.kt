@@ -10,6 +10,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
@@ -45,6 +46,9 @@ enum class DropCause {
     // Это «почти работает»: десинк победил блокировку SNI, осталась мелочь.
     HTTP_TIMEOUT,
     HTTP_BLOCKPAGE,
+    // Медиа-URL ответил HTTP, но не 200/206 (обычно 403/410): ссылка протухла или
+    // привязана к другому IP. Это НЕ вина DPI — надо обновить ссылку.
+    MEDIA_URL_DEAD,
     QUIC_TIMEOUT,
     QUIC_DROP,
     PROXY_FAIL,
@@ -61,8 +65,17 @@ enum class DropCause {
  */
 enum class TargetRole { PAGE, VIDEO, CONTROL }
 
-/** Цель проверки (один SNI + транспорт). */
-data class Target(val host: String, val role: TargetRole, val udp: Boolean = false)
+/**
+ * Цель проверки (один SNI + транспорт).
+ *  mediaPath — если задан (для VIDEO/TLS), проба не HEAD, а ranged-GET реального
+ *  сегмента: тянем MEDIA_BYTES_NEEDED байт. Это и есть 100% критерий видеопотока.
+ */
+data class Target(
+    val host: String,
+    val role: TargetRole,
+    val udp: Boolean = false,
+    val mediaPath: String? = null,
+)
 
 /** Результат пробы одной цели (один SNI). */
 data class ProbeResult(
@@ -92,6 +105,14 @@ data class CandidateResult(
 )
 
 /**
+ * Прямая ссылка на медиасегмент YouTube (googlevideo). host — конкретный CDN-edge
+ * (rrN---sn-xxxx.googlevideo.com), path — путь `/videoplayback?...` со всей query.
+ * Добывается один раз на сессию (YtStream.fetchPlayback) и переиспользуется всеми
+ * кандидатами: сам байтопоток гоняем через прокси, а тяжёлое извлечение — один раз.
+ */
+data class PlaybackUrl(val host: String, val path: String)
+
+/**
  * Перебирает наборы флагов ByeDPI и проверяет, открывается ли YouTube.
  *
  * Каждый кандидат проверяется СТРОГО последовательно: нативные params в ByeDPI
@@ -106,7 +127,9 @@ class ByeDpiTester(
     val targets: List<Target> = DEFAULT_TARGETS,
     // perProbeTimeoutMs — ОДНОВРЕМЕННО и таймаут пробы (обрубаем слишком долгие
     // попытки), и верхняя граница диагностического ms. Это НЕ критерий выбора.
-    private val perProbeTimeoutMs: Int = 5000,
+    // 2500мс: рабочий флаг отвечает за сотни мс, а мёртвый всё равно ждать нет смысла —
+    // урезали с 5000, чтобы неудачный кандидат не съедал по 5с на каждую пробу.
+    private val perProbeTimeoutMs: Int = 2500,
 ) {
     companion object {
         private const val TAG = "ByeDpiTester"
@@ -127,10 +150,25 @@ class ByeDpiTester(
             Target("redirector.googlevideo.com", TargetRole.VIDEO, udp = false),
             Target("redirector.googlevideo.com", TargetRole.VIDEO, udp = true),
         )
+
+        // Критерий «видео поехало»: сколько РЕАЛЬНЫХ байт медиа надо вытянуть сквозь
+        // прокси, чтобы засчитать. Скорость НЕ меряем (это обходчик DPI, а не тоннель —
+        // локальнее прокси всё равно не будет; важен факт, что байтопоток googlevideo
+        // пробился). 32 КБ достаточно, чтобы отличить «поток пошёл» от «RST/блокстраница».
+        private const val MEDIA_MIN_BYTES = 32 * 1024
+        private const val MEDIA_RANGE = 128 * 1024
+        private const val MEDIA_UA =
+            "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
     }
 
     private val sslFactory: SSLSocketFactory =
         SSLContext.getInstance("TLS").apply { init(null, null, null) }.socketFactory
+
+    // Свежий видеосегмент-URL рикролла на текущую сессию (обновляется программно через
+    // YtStream.fetchPlayback на каждый прогон — сам URL живёт ~6ч, но мы берём новый).
+    // null = не добыли → VIDEO/TLS откатывается на старый критерий (SNI-хендшейк).
+    @Volatile
+    var videoUrl: PlaybackUrl? = null
 
     /**
      * Контрольный замер ДО перебора: без прокси, напрямую. Возвращает пробы В
@@ -139,10 +177,31 @@ class ByeDpiTester(
     suspend fun baseline(): List<ProbeResult> = coroutineScope {
         // Цели независимы — гоняем параллельно (быстрее в N раз).
         targets.map { t ->
-            async(Dispatchers.IO) {
-                if (t.udp) probeQuicDirect(t.host) else probeDirect(t.host)
-            }
+            async(Dispatchers.IO) { probeDirectFor(t) }
         }.awaitAll()
+    }
+
+    /** Диспетчер прямой (без прокси) пробы: видео тянем реальным медиа-GET, если есть URL. */
+    private suspend fun probeDirectFor(t: Target): ProbeResult {
+        val pv = videoUrl
+        return when {
+            t.role == TargetRole.VIDEO && pv != null && !t.udp -> probeMedia(pv.host, pv.path, Proxy.NO_PROXY)
+            t.role == TargetRole.VIDEO && pv != null && t.udp -> probeQuicDirect(pv.host)
+            t.udp -> probeQuicDirect(t.host)
+            else -> probeDirect(t.host)
+        }
+    }
+
+    /** Диспетчер пробы через прокси-кандидат: видео = реальный медиа-GET, если есть URL. */
+    private suspend fun probeProxyFor(t: Target): ProbeResult {
+        val pv = videoUrl
+        val socks = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", testPort))
+        return when {
+            t.role == TargetRole.VIDEO && pv != null && !t.udp -> probeMedia(pv.host, pv.path, socks)
+            t.role == TargetRole.VIDEO && pv != null && t.udp -> probeQuicThroughProxy(pv.host)
+            t.udp -> probeQuicThroughProxy(t.host)
+            else -> probeThroughProxy(t.host)
+        }
     }
 
     /** Прогоняет один кандидат и возвращает агрегированный результат. */
@@ -159,7 +218,7 @@ class ByeDpiTester(
         }
 
         try {
-            if (!awaitPort(testPort, 2500)) {
+            if (!awaitPort(testPort, 1200)) {
                 job.cancel()
                 return CandidateResult(flags, false, DropCause.PROXY_FAIL, -1, emptyList())
             }
@@ -169,9 +228,7 @@ class ByeDpiTester(
             // одновременно живёт только один прокси. Внутри кандидата — можно.)
             var probes = coroutineScope {
                 targets.map { t ->
-                    async(Dispatchers.IO) {
-                        t to if (t.udp) probeQuicThroughProxy(t.host) else probeThroughProxy(t.host)
-                    }
+                    async(Dispatchers.IO) { t to probeProxyFor(t) }
                 }.awaitAll()
             }
 
@@ -182,12 +239,10 @@ class ByeDpiTester(
             // второго раза, а реально нерабочий — снова упадёт (ложных WORK не даёт).
             val failed = probes.filter { it.first.role != TargetRole.CONTROL && !it.second.ok }
             if (failed.isNotEmpty()) {
-                delay(700)
+                delay(300)
                 val retried = coroutineScope {
                     failed.map { (t, _) ->
-                        async(Dispatchers.IO) {
-                            t to if (t.udp) probeQuicThroughProxy(t.host) else probeThroughProxy(t.host)
-                        }
+                        async(Dispatchers.IO) { t to probeProxyFor(t) }
                     }.awaitAll()
                 }.toMap()
                 probes = probes.map { (t, r) ->
@@ -234,6 +289,8 @@ class ByeDpiTester(
                 Log.w(TAG, "stopProxy after test", e)
             }
             job.join()
+            // Освобождаем выделенный поток движка (по одному на кандидата).
+            proxy.dispose()
         }
     }
 
@@ -306,6 +363,90 @@ class ByeDpiTester(
                 }
             }
         }
+
+    // ---- Реальный медиа-GET к googlevideo (100% критерий: байты потока пошли) -----
+    // probe() выше проверяет лишь пробитие SNI (TLS-хендшейк + HEAD). Здесь мы РЕАЛЬНО
+    // тянем кусок видеосегмента рикролла (Range 0..128КБ) и требуем >=32КБ тела. Именно
+    // этот трафик режет/тормозит stateful-DPI: пришли байты — ролик будет играть.
+    private suspend fun probeMedia(host: String, path: String, proxy: Proxy): ProbeResult =
+        withContext(Dispatchers.IO) {
+            val t0 = System.currentTimeMillis()
+            val ip = resolveV4(host)?.hostAddress
+                ?: return@withContext ProbeResult(host, "MEDIA", false, DropCause.DNS_FAIL, elapsed(t0))
+            var raw: Socket? = null
+            var handshakeDone = false
+            try {
+                raw = Socket(proxy)
+                raw.connect(InetSocketAddress.createUnresolved(ip, 443), perProbeTimeoutMs)
+                raw.soTimeout = perProbeTimeoutMs
+                val ssl = sslFactory.createSocket(raw, host, 443, true) as SSLSocket
+                ssl.soTimeout = perProbeTimeoutMs
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    ssl.sslParameters = ssl.sslParameters.apply {
+                        serverNames = listOf(SNIHostName(host))
+                    }
+                }
+                ssl.startHandshake()
+                handshakeDone = true
+                val req = "GET $path HTTP/1.1\r\n" +
+                    "Host: $host\r\n" +
+                    "Range: bytes=0-${MEDIA_RANGE - 1}\r\n" +
+                    "User-Agent: $MEDIA_UA\r\n" +
+                    "Accept: */*\r\n" +
+                    "Connection: close\r\n\r\n"
+                ssl.outputStream.write(req.toByteArray())
+                ssl.outputStream.flush()
+                val ins = BufferedInputStream(ssl.inputStream, 16 * 1024)
+
+                val status = readAsciiLine(ins)
+                    ?: return@withContext ProbeResult(host, "MEDIA", false, DropCause.HTTP_TIMEOUT, elapsed(t0))
+                if (!status.startsWith("HTTP")) {
+                    return@withContext ProbeResult(host, "MEDIA", false, DropCause.HTTP_BLOCKPAGE, elapsed(t0))
+                }
+                val code = status.split(' ').getOrNull(1)?.toIntOrNull() ?: 0
+                if (code != 200 && code != 206) {
+                    return@withContext ProbeResult(host, "MEDIA", false, DropCause.HTTP_BLOCKPAGE, elapsed(t0))
+                }
+                // Пропускаем заголовки до пустой строки.
+                while (true) {
+                    val line = readAsciiLine(ins) ?: break
+                    if (line.isEmpty()) break
+                }
+                // Тянем тело, пока не наберём порог (или поток не оборвётся).
+                var total = 0
+                val buf = ByteArray(16 * 1024)
+                while (total < MEDIA_MIN_BYTES) {
+                    val n = ins.read(buf)
+                    if (n < 0) break
+                    total += n
+                }
+                if (total >= MEDIA_MIN_BYTES) {
+                    ProbeResult(host, "MEDIA", true, DropCause.OK, elapsed(t0))
+                } else {
+                    // Хендшейк прошёл, статус ок, но тело оборвалось не добрав порога —
+                    // ровно stateful-DPI, режущий медиа после старта. Это НЕ PASS.
+                    ProbeResult(host, "MEDIA", false, DropCause.HTTP_TIMEOUT, elapsed(t0))
+                }
+            } catch (e: Exception) {
+                ProbeResult(host, "MEDIA", false, classify(e, raw, handshakeDone), elapsed(t0))
+            } finally {
+                try { raw?.close() } catch (_: Exception) {}
+            }
+        }
+
+    /** Одна ASCII-строка из потока (до \n), \r отбрасывается. null — если поток пуст. */
+    private fun readAsciiLine(ins: InputStream): String? {
+        val sb = StringBuilder()
+        var any = false
+        while (true) {
+            val b = ins.read()
+            if (b < 0) return if (any) sb.toString() else null
+            any = true
+            if (b == '\n'.code) break
+            if (b != '\r'.code) sb.append(b.toChar())
+        }
+        return sb.toString()
+    }
 
     // ---- QUIC / UDP проба -------------------------------------------------
     // Видео YouTube идёт по QUIC (UDP-443). Шлём ЧЕСТНЫЙ QUIC Initial с реальным

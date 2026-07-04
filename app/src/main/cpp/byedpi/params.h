@@ -110,7 +110,7 @@ struct params {
     char *protect_path;
 };
 
-extern struct params params;
+extern __thread struct params params;
 
 extern struct packet fake_tls;
 extern struct packet fake_http;

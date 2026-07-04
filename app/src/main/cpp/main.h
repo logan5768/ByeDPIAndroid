@@ -1,5 +1,5 @@
 extern char *oob_char;
-extern int NOT_EXIT;
+extern __thread int NOT_EXIT;
 
 struct sockaddr_ina;
 
